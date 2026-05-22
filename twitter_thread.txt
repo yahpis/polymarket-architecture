@@ -49,8 +49,8 @@ A BUY YES taker CANNOT directly match a SELL NO maker. The contract reverts with
 
 After all makers are filled, _updateTakingWithSurplus checks Exchange's actual balance. Any extra tokens from minting/merging roundings go to the taker. Leftover collateral is also refunded to the taker.
 
-10/ 完整分析 + 交互状态机 + Solidity 逐行 trace：
-github.com/yahpis/polymarket-architecture
+10/ 完整文章：paragraph.com/@yahpis/polymarket-match-engine-—-a-complete-trace
+交互状态机 + Solidity 源码：github.com/yahpis/polymarket-architecture
 
 对交易所集成的深度审计感兴趣？DM open。
 
