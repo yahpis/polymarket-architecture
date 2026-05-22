@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket Match Engine — A Complete Trace</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d2991d;
+    --red: #f85149;
+    --code-bg: #1c2128;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    line-height: 1.7;
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 40px 20px 80px;
+  }
+  h1 { font-size: 2em; margin-bottom: 8px; letter-spacing: -0.5px; }
+  h2 { font-size: 1.4em; margin: 40px 0 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.15em; margin: 28px 0 12px; color: var(--accent); }
+  p, li { margin-bottom: 14px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .date { color: var(--muted); font-size: 0.9em; margin-bottom: 24px; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+    font-size: 0.85em;
+    line-height: 1.5;
+    margin-bottom: 18px;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 0.9em;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+  }
+  th { background: var(--card); color: var(--accent); }
+  td code { font-size: 0.85em; }
+  blockquote {
+    border-left: 3px solid var(--accent);
+    padding: 8px 16px;
+    margin: 16px 0;
+    color: var(--muted);
+    background: var(--card);
+    border-radius: 0 6px 6px 0;
+  }
+  hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+  .cta-box {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin: 32px 0;
+  }
+  .cta-box h3 { margin-top: 0; }
+  .diagram-links {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin: 20px 0;
+  }
+  .diagram-link {
+    display: block;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+    transition: border-color 0.2s;
+  }
+  .diagram-link:hover { border-color: var(--accent); text-decoration: none; }
+  .diagram-link .icon { font-size: 1.5em; margin-bottom: 4px; }
+  .gated {
+    background: var(--card);
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    margin: 24px 0;
+    text-align: center;
+    color: var(--muted);
+  }
+  .asset-trace {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.82em;
+    line-height: 1.4;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 16px 0;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .risk-item {
+    background: var(--card);
+    border-left: 3px solid var(--orange);
+    border-radius: 0 8px 8px 0;
+    padding: 12px 16px;
+    margin: 12px 0;
+  }
+  .risk-item strong { color: var(--orange); }
+</style>
+</head>
+<body>
+
+<h1>Polymarket Match Engine — A Complete Trace</h1>
+<p class="date">Published May 22, 2026 · 12 min read · <a href="https://github.com/yahpis/polymarket-architecture">GitHub</a></p>
+
+<p>I spent today taking apart Polymarket's matching engine.</p>
+<p>Not reading docs. Not guessing. Tracing every function call from user signature to on-chain settlement, line by line, against the verified <code>CTFExchange.sol</code> on Polygon.</p>
+<p>What I found: a surprisingly elegant design that the official documentation barely covers.</p>
+
+<hr>
+
+<h2>1. There is no AMM</h2>
+<p>This is the biggest misconception about Polymarket.</p>
+<p>When you see <code>outcomePrices: ["0.17", "0.83"]</code> on the Gamma API, those numbers come from <code>/midpoint</code> — the CLOB's best bid/ask midpoint. Not from an AMM curve, not from a bonding curve, not from a liquidity pool.</p>
+<p>Polymarket migrated from AMM to CLOB in mid-2023. The AMM is gone. The CLOB is the sole pricing layer.</p>
+<p>I verified this by querying three CLOB endpoints:</p>
+
+<pre>/book           → best_bid = 0.171, best_ask = 0.172
+/midpoint       → mid = 0.1715
+/price?side=buy → price = 0.171
+/spread         → spread = 0.001
+
+Gamma outcomePrices → YES=0.17, NO=0.83
+               = /midpoint(rounded)
+               = (0.171+0.172)/2 ≈ 0.17</pre>
+
+<p>The numbers match perfectly.</p>
+
+<h2>2. The unified order book with mirror translation</h2>
+<p>When you query <code>/book?token_id=YES_token</code>, you get 168 orders. When you query <code>/book?token_id=NO_token</code>, you get <strong>zero</strong>.</p>
+<p>This isn't a bug. Polymarket maintains a <strong>single unified order book</strong> for each market. All NO-side orders are internally mirrored into YES-side equivalents:</p>
+
+<pre>BUY NO @ 0.83  →  mirrored as SELL YES @ 0.17
+SELL NO @ 0.15 →  mirrored as BUY YES @ 0.85</pre>
+
+<p>This mirroring is why Polymarket achieves a 0.001 spread on a $23M-volume market. The unified book aggregates everything onto one price ladder.</p>
+
+<h2>3. The EIP-712 Order: exactly 12 fields</h2>
+<p>The canonical Order structure is defined in <code>ORDER_TYPEHASH</code>:</p>
+
+<pre>bytes32 constant ORDER_TYPEHASH = keccak256(
+    "Order(uint256 salt,address maker,address signer,
+     address taker,uint256 tokenId,uint256 makerAmount,
+     uint256 takerAmount,uint256 expiration,uint256 nonce,
+     uint256 feeRateBps,uint8 side,uint8 signatureType)"
+);</pre>
+
+<table>
+<tr><th>Field</th><th>Type</th><th>Purpose</th></tr>
+<tr><td>salt</td><td>uint256</td><td>Random salt, prevents replay</td></tr>
+<tr><td>maker</td><td>address</td><td>Address holding the funds</td></tr>
+<tr><td>signer</td><td>address</td><td>Address that signs the order</td></tr>
+<tr><td>taker</td><td>address</td><td>0x0 = public order</td></tr>
+<tr><td>tokenId</td><td>uint256</td><td>CTF ERC1155 token being traded</td></tr>
+<tr><td>makerAmount</td><td>uint256</td><td>Maximum tokens to sell</td></tr>
+<tr><td>takerAmount</td><td>uint256</td><td>Minimum tokens to receive</td></tr>
+<tr><td>expiration</td><td>uint256</td><td>Unix timestamp (0 = never expires)</td></tr>
+<tr><td>nonce</td><td>uint256</td><td>For on-chain cancellation</td></tr>
+<tr><td>feeRateBps</td><td>uint256</td><td>Fee in basis points</td></tr>
+<tr><td>side</td><td>uint8</td><td>0 = BUY, 1 = SELL</td></tr>
+<tr><td>signatureType</td><td>uint8</td><td>0 = EOA, 1 = POLY_PROXY, 2 = GNOSIS_SAFE</td></tr>
+</table>
+
+<p>No <code>outcomeIndex</code> field. No <code>orderId</code> field. The outcome is determined by <code>tokenId</code> alone.</p>
+
+<hr>
+
+<h2>4. The matching engine: _isCrossing & _deriveMatchType</h2>
+
+<p>The matching engine uses two functions from <code>Trading.sol</code> to decide how to settle each match:</p>
+
+<h3>_isCrossing (CalculatorHelper.sol L74-88)</h3>
+<p>Checks price compatibility:</p>
+<pre>BUY × BUY:   priceA + priceB >= 1      → MINT condition
+BUY × SELL:  priceA >= priceB           → COMPLEMENTARY condition
+SELL × BUY:  priceB >= priceA           → COMPLEMENTARY condition
+SELL × SELL: priceA + priceB <= 1      → MERGE condition</pre>
+
+<h3>_deriveMatchType (Trading.sol L230-234)</h3>
+<p>Dispatches to one of three match types:</p>
+<pre>if (taker.side == BUY && maker.side == BUY) return MINT;
+if (taker.side == SELL && maker.side == SELL) return MERGE;
+return COMPLEMENTARY;</pre>
+
+<p>The key constraint: COMPLEMENTARY matches <strong>must have the same tokenId</strong>:</p>
+<pre>if (matchType == MatchType.COMPLEMENTARY) {
+    if (takerOrder.tokenId != makerOrder.tokenId)
+        revert MismatchedTokenIds();
+}</pre>
+
+<p>This means a BUY YES taker cannot directly match a SELL NO maker. Cross-token matching requires MINT/MERGE paths.</p>
+
+<h2>5. The three settlement branches</h2>
+
+<h3>COMPLEMENTARY (buy vs sell, same tokenId)</h3>
+<p>The simplest path. <code>_executeMatchCall</code> returns immediately — it's a nop. Tokens already exist. The Exchange orchestrates the transfer:</p>
+<pre>Maker → Exchange: CTF token
+Exchange → Maker: USDC (proceeds minus fees)</pre>
+
+<h3>MINT (both buy, complementary tokens)</h3>
+<p>Two buyers want opposite outcomes. Exchange pools their USDC and calls <code>CTF.splitPosition()</code>:</p>
+<pre>// Taker BUY YES @ 0.30, Maker BUY NO @ 0.70
+// Exchange pools: 0.30 + 0.70 = 1.00 USDC
+CTF.splitPosition(USDC, conditionId, [1,2], 1_000_000)
+// → 1 YES + 1 NO created from thin air
+// → Taker receives YES, Maker receives NO</pre>
+<p>The asset <strong>changes form</strong> inside the transaction — USDC becomes outcome tokens.</p>
+
+<h3>MERGE (both sell, complementary tokens)</h3>
+<p>Reverse of MINT. Two sellers, Exchange calls <code>CTF.mergePositions()</code>:</p>
+<pre>// Taker SELL YES, Maker SELL NO
+CTF.mergePositions(USDC, conditionId, [1,2], 1)
+// → 1 YES + 1 NO destroyed
+// → 1.00 USDC returned, distributed by price ratio</pre>
+
+<h2>6. Complete _matchOrders trace</h2>
+<p><strong>Scenario:</strong> Taker BUY YES, 3 makers:</p>
+<ul>
+<li>Maker A: SELL YES @ 0.172, 15 shares → COMPLEMENTARY</li>
+<li>Maker B: BUY NO @ 0.83, 20 shares → MINT</li>
+<li>Maker C: SELL YES @ 0.50, 10 shares → COMPLEMENTARY</li>
+</ul>
+
+<h3>Exchange balance tracking</h3>
+<div class="asset-trace">Step 0: Exchange = {USDC: 0, YES: 0, NO: 0}
+
+Step 1 — Taker deposits: _transfer(taker→Exchange, USDC, 45)
+         Exchange = {USDC: 45, YES: 0, NO: 0}
+
+Step 2 — Maker A COMPLEMENTARY:
+  makerA sends YES→Exchange    : {USDC: 45, YES: 15, NO: 0}
+  Exchange pays USDC→makerA    : {USDC: 42.42, YES: 15, NO: 0}
+
+Step 3 — Maker B MINT:
+  makerB sends USDC→Exchange   : {USDC: 62.42, YES: 15, NO: 0}
+  splitPosition(20 USDC)       : {USDC: 42.42, YES: 35, NO: 20}
+  Exchange pays NO→makerB      : {USDC: 42.42, YES: 35, NO: 0}
+
+Step 4 — Maker C COMPLEMENTARY:
+  makerC sends YES→Exchange    : {USDC: 42.42, YES: 45, NO: 0}
+  Exchange pays USDC→makerC    : {USDC: 37.42, YES: 45, NO: 0}
+
+Step 5 — Taker receives YES:
+  Exchange→taker: 45 YES       : {USDC: 37.42, YES: 0, NO: 0}
+
+Step 6 — Refund leftover USDC:
+  Exchange→taker: 37.42 USDC   : {USDC: 0, YES: 0, NO: 0}</div>
+
+<p><strong>Taker net result:</strong> Spent 7.58 USDC, received 45 YES. <strong>Effective price: 0.168 YES/USDC.</strong></p>
+
+<h2>7. Risk areas identified</h2>
+
+<div class="risk-item"><strong>① MINT USDC consumption:</strong> All pooled USDC is consumed by splitPosition. If the sum doesn't exactly equal the mint amount, the transaction reverts. No partial mints.</div>
+
+<div class="risk-item"><strong>② COMPLEMENTARY tokenId constraint:</strong> BUY YES × SELL NO is invalid. Integrators who don't check tokenId compatibility will get MismatchedTokenIds reverts.</div>
+
+<div class="risk-item"><strong>③ Surplus asymmetry:</strong> _updateTakingWithSurplus gives all excess to the taker. Makers in MERGE don't receive surplus from rounding. The taker is structurally favored.</div>
+
+<div class="risk-item"><strong>④ Mixed batch atomicity:</strong> A revert from any single maker invalidates the entire batch. The operator must ensure all orders are valid before constructing the batch.</div>
+
+<div class="risk-item"><strong>⑤ Exchange as escrow:</strong> Between fills, the Exchange holds all intermediate assets. Any reentrancy vulnerability could compromise the batch. (No known vulnerability — but the centralization of assets during execution is worth noting.)</div>
+
+<hr>
+
+<div class="cta-box">
+<h3>🔗 Interactive Diagrams</h3>
+<p>I built three interactive state machines — each node is clickable and shows the exact Solidity source code:</p>
+<div class="diagram-links">
+  <a class="diagram-link" href="polymarket_order_lifecycle.html">
+    <div class="icon">🔄</div>
+    <strong>Order Lifecycle</strong><br>
+    <small>19 nodes · Signature → Settlement</small>
+  </a>
+  <a class="diagram-link" href="polymarket_matching_subdiagram.html">
+    <div class="icon">⚡</div>
+    <strong>Matching Decision</strong><br>
+    <small>10 nodes · _isCrossing → _matchOrders</small>
+  </a>
+  <a class="diagram-link" href="polymarket_matchorders_trace.html">
+    <div class="icon">🔍</div>
+    <strong>On-Chain Trace</strong><br>
+    <small>Step-by-step asset flow</small>
+  </a>
+</div>
+</div>
+
+<div class="cta-box">
+<h3>📦 GitHub</h3>
+<p>Complete source code, diagrams, and Twitter thread: <a href="https://github.com/yahpis/polymarket-architecture">github.com/yahpis/polymarket-architecture</a></p>
+<p style="margin-top: 8px; color: var(--muted);">For technical questions or exchange integration audits, DM me on X or Discord.</p>
+</div>
+
+</body>
+</html>
