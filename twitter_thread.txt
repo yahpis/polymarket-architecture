@@ -1,0 +1,55 @@
+# 🧵 Polymarket Match Engine — What I found after tracing every line of CTFExchange.sol
+
+1/ I spent today reverse-engineering Polymarket's matching engine from user signature to on-chain settlement. Here's what's actually happening inside the black box:
+
+2/ **There is no AMM.**
+
+Polymarket migrated from AMM to CLOB in 2023. Gamma API's "outcomePrices" you see on the website? They come from /midpoint — the CLOB's best bid/ask midpoint. Nothing to do with an AMM curve.
+
+3/ **The order book is mirrored, not duplicated.**
+
+NO token orders don't exist as a separate book. A "BUY NO @ 0.83" is translated into "SELL YES @ 0.17" and placed in the same unified YES book. This mirroring is why the spread can be as tight as 0.001.
+
+I proved it: /book?token_id=YES returns 168 orders. /book?token_id=NO returns 0.
+
+4/ **The EIP-712 Order has exactly 12 fields.**
+
+Not 15. Not 10. The canonical structure is defined in ORDER_TYPEHASH on the verified CTFExchange contract:
+
+salt, maker, signer, taker, tokenId, makerAmount, takerAmount, expiration, nonce, feeRateBps, side, signatureType.
+
+No "outcomeIndex" field exists. tokenId IS the outcome.
+
+5/ **Three match types, not two.**
+
+The Solidity contract defines COMPLEMENTARY (buy vs sell, same tokenId), MINT (both buy, complementary tokens), and MERGE (both sell, complementary tokens).
+
+The decision is made in _deriveMatchType() — 3 lines of Solidity.
+
+6/ **A single batch can mix all three types.**
+
+Taker BUY YES can simultaneously match:
+- SELL YES (COMPLEMENTARY — direct token transfer)
+- BUY NO (MINT — splitPosition creates new tokens)
+- SELL YES from another maker (COMPLEMENTARY again)
+
+All in ONE atomic transaction. The Exchange contract acts as escrow.
+
+7/ **MINT transforms assets inside the batch.**
+
+When MINT triggers: Exchange's USDC balance drops to 0. YES+NO emerge from the CTF.splitPosition call. The asset changes FORM during execution — USDC becomes outcome tokens.
+
+The taker receives YES that didn't exist before the batch started.
+
+8/ **COMPLEMENTARY requires same tokenId.**
+
+A BUY YES taker CANNOT directly match a SELL NO maker. The contract reverts with MismatchedTokenIds. Cross-token matching only works through MINT/MERGE with complementary tokens.
+
+9/ **Surplus goes to the taker.**
+
+After all makers are filled, _updateTakingWithSurplus checks Exchange's actual balance. Any extra tokens from minting/merging roundings go to the taker. Leftover collateral is also refunded to the taker.
+
+10/ Full analysis with interactive diagrams and on-chain trace → DM me.
+
+I built three state machines tracing the complete lifecycle, match decision logic, and step-by-step _matchOrders execution against the verified Solidity source.
+

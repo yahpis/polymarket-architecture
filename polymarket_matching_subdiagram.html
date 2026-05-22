@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>撮合判定子图</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9}
+#root{display:flex;height:100vh}
+.canvas{flex:1;overflow:auto;background:#0d1117}
+.panel{width:440px;background:#161b22;border-left:1px solid #30363d;overflow-y:auto;padding:20px;font-size:13px;line-height:1.6}
+.panel h3{color:#58a6ff;margin-bottom:8px;font-size:15px}
+.panel code{background:#1c2128;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:11px;color:#e6edf3;display:block;margin:4px 0;white-space:pre-wrap;line-height:1.5}
+.panel pre{background:#1c2128;padding:8px 10px;border-radius:4px;font-family:monospace;font-size:11px;color:#e6edf3;margin:6px 0;white-space:pre;line-height:1.5;overflow-x:auto}
+.panel hr{border:none;border-top:1px solid #30363d;margin:12px 0}
+.panel h4{color:#7ee787;font-size:13px;margin:12px 0 4px}
+.node rect{fill:#1c2128;stroke:#30363d;stroke-width:2;rx:6;cursor:pointer;transition:all .15s}
+.node:hover rect{stroke:#58a6ff;filter:brightness(1.4)}
+.node.selected rect{stroke:#f78166;stroke-width:3}
+.node text{fill:#c9d1d9;font-size:10px;pointer-events:none;dominant-baseline:central}
+.node .label{font-size:12px;font-weight:600;fill:#e6edf3}
+.edge line{stroke:#30363d;stroke-width:2}
+.edge.p line{stroke:#3fb950;stroke-width:2.5}
+.edge.mint line{stroke:#d2991d;stroke-width:2}
+.edge.merge line{stroke:#bc8cff;stroke-width:2}
+.edge polygon{fill:#30363d}
+.edge.p polygon{fill:#3fb950}
+.edge.mint polygon{fill:#d2991d}
+.edge.merge polygon{fill:#bc8cff}
+.edge text{fill:#8b949e;font-size:8px}
+.legend{position:absolute;bottom:16px;left:16px;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 14px;font-size:11px}
+.legend-item{display:flex;align-items:center;gap:8px;margin:4px 0}
+.legend-line{width:20px;height:2px}
+</style>
+</head>
+<body><div id="root"></div>
+<script type="text/babel">
+const {useState}=React;const W=180,H=52;
+
+const NODES=[
+  {id:"taker",   x:30, y:60, label:"Taker 入站", phase:"operator",
+   desc:"POST /order 验证通过\nOrder 进入撮合引擎",
+   code:`// 运营商接收 validated SignedOrder
+// taker: BUY YES @ 0.17, size=100
+{
+  "tokenId": "4394...08080",  // YES
+  "side": 0,                   // BUY
+  "makerAmount": "17000000",  // 17 USDC
+  "takerAmount": "100"        // 100 shares
+}`},
+
+  {id:"unified",  x:260, y:60, label:"统一 YES book 扫描", phase:"operator",
+   desc:"NO 单已镜像:\nBUY NO @ q ≡ SELL YES @ 1-q\n只有一份 unified order book",
+   code:`// Polymarket 统一订单簿 —— 关键设计
+// "每个 Outcome 1 在价格 X 的 BUY 订单
+//  同时被视为 Outcome 2 在 (100¢ - X) 的 SELL 订单"
+//
+// 所以 /book?token_id=YES_token 返回的就是全部流动性
+// /book?token_id=NO_token 返回空 — 因为都在 YES book 里了
+
+// taker BUY YES @ 0.17
+// 扫描: 所有 ask ≤ 0.17 的 resting orders
+// 每个 resting order 是 price-time 顺序排列`},
+
+  {id:"cross",   x:530, y:60,  label:"_isCrossing\n价格相容判定", phase:"operator",
+   desc:"逐 maker 用 CalculatorHelper\n检查价格是否相容",
+   code:`// CalculatorHelper.sol L74-88
+function _isCrossing(priceA,priceB,sideA,sideB):
+  BUY × BUY:   priceA + priceB >= 1
+  BUY × SELL:  priceA >= priceB
+  SELL × BUY:  priceB >= priceA
+  SELL × SELL: priceA + priceB <= 1
+
+// 不满足 → skip 此 maker, 试下一个
+// 满足 → 继续判定 matchType`},
+
+  {id:"matchtype",x:780, y:60,  label:"_deriveMatchType\n模式判定", phase:"operator",
+   desc:"看 taker × maker 原始 side\n分叉到三种结算模式",
+   code:`// Trading.sol L230-234
+function _deriveMatchType(taker, maker):
+  if taker.side==BUY && maker.side==BUY → MINT
+  if taker.side==SELL && maker.side==SELL → MERGE
+  return COMPLEMENTARY
+
+// COMPLEMENTARY: 必须同 tokenId
+// MINT/MERGE: 必须 tokenId 互补 (YES↔NO)`},
+
+  {id:"complement",x:1050,y:20, label:"COMPLEMENTARY\n直接撮合", phase:"settle",
+   desc:"buy vs sell 同 tokenId\n纯 CTF 转账, 无特殊操作",
+   code:`// _executeMatchCall:
+if matchType == COMPLEMENTARY: return;  // nop
+
+// 直接撮合 (taker BUY YES @ 0.17 × maker SELL YES @ 0.17)
+// maker → taker: YES token × FillAmount
+// taker → maker: USDC × (FillAmount × 0.17)`},
+
+  {id:"mint",     x:1050,y:160, label:"MINT\n铸造新 CTF", phase:"settle",
+   desc:"双方同向 BUY\ntokenId 互补\n凑 USDC → _mint()",
+   code:`// Trading.sol L256-259
+if matchType == MINT:
+  _mint(getConditionId(takerAssetId), takingAmount)
+
+// taker BUY YES @ 0.30 → 出 0.30 USDC
+// maker BUY NO  @ 0.70 → 出 0.70 USDC
+// CTF.splitPosition(collateral,conditionId,[1,2],1e6)
+// → 铸 YES×1 + NO×1
+// → taker 得 YES, maker 得 NO`},
+
+  {id:"merge",    x:1050,y:310, label:"MERGE\n合并销毁", phase:"settle",
+   desc:"双方同向 SELL\ntokenId 互补\n凑 token → _merge()",
+   code:`// Trading.sol L260-262
+if matchType == MERGE:
+  _merge(getConditionId(makerAssetId), makingAmount)
+
+// taker SELL YES → 交出 1 YES
+// maker SELL NO  → 交出 1 NO
+// CTF.mergePositions(collateral,conditionId,[1,2],1)
+// → 销毁 YES+NO → 换 1 USDC
+// → 按价格分账`},
+
+  {id:"perfcheck", x:530, y:200, label:"_performOrderChecks\n(逐 maker)", phase:"operator",
+   desc:"验证 maker order 状态\n+ 计算 taking amount",
+   code:`// Trading.sol L163-177
+function _performOrderChecks(order, making):
+  1. _validateTaker(order.taker)   // 公开单 or 指定对手
+  2. hashOrder(order)              // keccak256(EIP-712 struct)
+  3. _validateOrder: 到期/签名/fee/token/填充/随机数
+  4. takingAmount = making * takerAmount / makerAmount
+  5. _updateOrderStatus → storage
+
+// 任一步 revert → 整批 abort`},
+
+  {id:"batch",    x:1330,y:170, label:"批聚合", phase:"operator",
+   desc:"1 takerOrder + N makerOrders\n+ N fillAmounts\n→ 1 笔 matchOrders 调用",
+   code:`// _matchOrders 签名:
+_matchOrders(
+    takerOrder,           // Order
+    makerOrders[],        // Order[N]
+    takerFillAmount,      // uint256
+    makerFillAmounts[]    // uint256[N]
+)
+
+// 只需 1 笔链上 tx → 原子执行`},
+
+  {id:"matchorders",x:1560,y:170, label:"CTFExchange\n_matchOrders", phase:"chain",
+   desc:"① taker 抵押品转入 Exchange\n② 逐 maker _fillMakerOrder\n③ _updateTakingWithSurplus\n④ 扣费 + 转账 + 退零头\n⑤ emit OrdersMatched",
+   code:`// Trading.sol L105-147
+1. _transfer(taker→Exchange, makerAsset, making)
+2. 逐 maker: _fillMakerOrder
+   ├ _deriveMatchType(taker, maker)
+   ├ _validateTakerAndMaker  // isCrossing + tokenId pair check
+   ├ _performOrderChecks
+   └ _fillFacingExchange
+      ├ _transfer(maker→Exchange, makerAsset)
+      ├ _executeMatchCall  // COMPLEMENTARY=skip MINT=_mint MERGE=_merge
+      └ _transfer(Exchange→maker, takerAsset-fee)
+3. _updateTakingWithSurplus
+4. _transfer(Exchange→taker, takerAsset-fee)
+5. emit OrdersMatched`},
+];
+
+const EDGES=[
+  {f:"taker",   t:"unified",   c:"p"},
+  {f:"unified", t:"cross",     c:"p", label:"price-time scan"},
+  {f:"cross",   t:"matchtype", c:"p", label:"相容 ✓"},
+  {f:"cross",   t:"unified",   c:"p", label:"不相容 → skip"},
+  {f:"matchtype",t:"complement",c:"p", label:"COMPLEMENTARY"},
+  {f:"matchtype",t:"mint",     c:"mint", label:"MINT"},
+  {f:"matchtype",t:"merge",    c:"merge", label:"MERGE"},
+  {f:"cross",   t:"perfcheck", c:"p", label:"逐maker验证"},
+  {f:"perfcheck",t:"matchtype",c:"p"},
+  {f:"complement",t:"batch",   c:"p"},
+  {f:"mint",    t:"batch",     c:"p"},
+  {f:"merge",   t:"batch",     c:"p"},
+  {f:"batch",   t:"matchorders",c:"p", label:"1 tx"},
+];
+
+const App=()=>{
+  const [sel,setSel]=useState("taker");
+  const nm=Object.fromEntries(NODES.map(n=>[n.id,n]));
+  const s=nm[sel];
+
+  return <div style={{display:"flex",height:"100vh"}}>
+    <div className="canvas" style={{position:"relative"}}>
+      <svg viewBox="0 0 1800 420" style={{minWidth:1800,minHeight:420}}>
+        {EDGES.map((e,i)=>{
+          const f=nm[e.f],t=nm[e.t];
+          let sx=f.x+W/2,sy=f.y+H/2,ex=t.x+W/2,ey=t.y+H/2;
+          let dx=ex-sx,dy=ey-sy,len=Math.sqrt(dx*dx+dy*dy);
+          if(len<1)return null;
+          let ux=dx/len,uy=dy/len,ah=5,aw=7;
+          let esx,esy,eex,eey;
+          if(Math.abs(dx)>Math.abs(dy)){
+            esx=sx<ex?f.x+W:f.x;esy=sy;eex=sx<ex?t.x:t.x+W;eey=ey;
+          }else{
+            esx=sx;esy=sy<ey?f.y+H:f.y;eex=ex;eey=sy<ey?t.y:t.y+H;
+          }
+          let epx=eex-ux*aw,epy=eey-uy*aw;
+          let mlx=(esx+epx)/2-uy*6,mly=(esy+epy)/2+ux*6;
+          return <g key={i} className={`edge ${e.c}`}>
+            <line x1={esx} y1={esy} x2={epx} y2={epy}/>
+            <polygon points={`${eex},${eey} ${epx-uy*ah},${epy+ux*ah} ${epx+uy*ah},${epy-ux*ah}`}/>
+            {e.label&&<text x={mlx} y={mly} textAnchor="middle" fontSize={8} fill="#8b949e">{e.label}</text>}
+          </g>;
+        })}
+        {NODES.map(n=>{
+          let isSel=n.id===sel;
+          let sc=n.phase==="chain"&&isSel?"#58a6ff":isSel?"#f78166":"#30363d";
+          let fill="#1c2128";
+          return <g key={n.id} className={`node${isSel?' selected':''}`} onClick={()=>setSel(n.id)}>
+            <rect x={n.x} y={n.y} width={W} height={n.phase==="settle"?H+20:H} fill={fill} stroke={sc}/>
+            {(n.label||"").split('\n').map((l,i)=>
+              <text key={i} className={i===0?"label":""} x={n.x+W/2} y={n.y+16+i*16} textAnchor="middle" fontSize={i===0?12:10}>{l}</text>
+            )}
+          </g>;
+        })}
+      </svg>
+      <div className="legend">
+        <div className="legend-item"><div className="legend-line" style={{background:"#3fb950"}}/><span>COMPLEMENTARY 路径</span></div>
+        <div className="legend-item"><div className="legend-line" style={{background:"#d2991d"}}/><span>MINT 铸造路径</span></div>
+        <div className="legend-item"><div className="legend-line" style={{background:"#bc8cff"}}/><span>MERGE 合并路径</span></div>
+        <div style={{marginTop:6,color:"#8b949e",fontSize:10}}>点击节点查看合约源码 | 定价逻辑来自 Trading.sol + CalculatorHelper.sol</div>
+      </div>
+    </div>
+    <div className="panel">
+      <h3>{s.label.split('\n')[0]}</h3>
+      <div style={{color:"#8b949e",marginBottom:12}}>{(s.desc||"").split('\n').map((l,i)=><div key={i}>{l}</div>)}</div>
+      {s.code && <><hr/><h4>{s.phase==="chain"?"Solidity 源码":"运营商逻辑"}</h4><code>{s.code}</code></>}
+    </div>
+  </div>;
+};
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket 订单生命周期</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9}
+#root{display:flex;height:100vh}
+.canvas{flex:1;overflow:auto;background:#0d1117}
+.panel{width:440px;background:#161b22;border-left:1px solid #30363d;overflow-y:auto;padding:20px;font-size:13px;line-height:1.6}
+.panel h3{color:#58a6ff;margin-bottom:8px;font-size:15px}
+.panel code{background:#1c2128;padding:2px 6px;border-radius:3px;font-family:monospace;font-size:11px;color:#e6edf3;display:block;margin:4px 0;white-space:pre-wrap;line-height:1.5}
+.panel pre{background:#1c2128;padding:8px 10px;border-radius:4px;font-family:monospace;font-size:11px;color:#e6edf3;margin:6px 0;white-space:pre;line-height:1.5;overflow-x:auto}
+.panel .err{color:#f85149;background:#1c2128;padding:8px 12px;border-radius:4px;margin:8px 0;border-left:3px solid #f85149}
+.panel .note{color:#d2a8ff;font-size:12px;margin:6px 0;padding:6px 10px;background:#1c2128;border-radius:4px}
+.panel hr{border:none;border-top:1px solid #30363d;margin:16px 0}
+.panel h4{color:#7ee787;font-size:13px;margin:12px 0 4px}
+.panel .fund{background:#1c2128;padding:10px;border-radius:6px;margin:8px 0;font-family:monospace;font-size:11px;line-height:1.6;white-space:pre;color:#a5d6ff}
+.node rect{fill:#1c2128;stroke:#30363d;stroke-width:2;rx:6;cursor:pointer;transition:all .15s}
+.node:hover rect{stroke:#58a6ff;filter:brightness(1.4)}
+.node.selected rect{stroke:#f78166;stroke-width:3}
+.node text{fill:#c9d1d9;font-size:10px;pointer-events:none;dominant-baseline:central}
+.node .label{font-size:12px;font-weight:600;fill:#e6edf3}
+.node.session rect{stroke-dasharray:4 3;stroke:#8b949e}
+.edge line{stroke:#30363d;stroke-width:2}
+.edge.p line{stroke:#3fb950;stroke-width:2.5}
+.edge.e line{stroke:#f85149;stroke-width:1.5;stroke-dasharray:6 3}
+.edge.mint line{stroke:#d2991d;stroke-width:2}
+.edge polygon{fill:#30363d}
+.edge.p polygon{fill:#3fb950}
+.edge.e polygon{fill:#f85149}
+.edge.mint polygon{fill:#d2991d}
+.edge text{fill:#8b949e;font-size:8px}
+.phase-band{opacity:0.15}
+.phase-label{fill:#484f58;font-size:10px;font-weight:600;letter-spacing:1px}
+.legend{position:absolute;bottom:16px;left:16px;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 14px;font-size:11px}
+.legend-item{display:flex;align-items:center;gap:8px;margin:4px 0}
+.legend-line{width:20px;height:2px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState } = React;
+
+const W=170, H=50;
+
+// ─── NODES ───────────────────────────────────────────────
+const NODES = [
+  // === Pre-flight ===
+  {id:"query",   x:20,  y:60,  label:"市场查询",          phase:"preflight",
+   desc:"GET /tick-size /neg-risk /fee-rate\nGET /balance-allowance",
+   code:`tick_size = client.get_tick_size(token_id)    # GET /tick-size
+neg_risk  = client.get_neg_risk(token_id)     # GET /neg-risk
+fee_rate  = client.get_fee_rate_bps(token_id) # GET /fee-rate
+balance   = client.get_balance_allowance(...) # GET /balance-allowance`,
+   errors:["tick_size: 价格不在 [min_tick, 1-min_tick]","neg_risk: 正负风险市场判断错误","fee_rate: 用户费率与市场费率不一致","balance: USDC 余额不足"]},
+
+  {id:"validate", x:220, y:60,  label:"参数校验",         phase:"preflight",
+   desc:"tick_size 合规性\nprice 有效性\nfee_rate 匹配\nnegRisk 标志检查",
+   code:`# price_valid() — utilities.py
+def price_valid(price, tick_size):
+    return float(tick_size) <= price <= 1 - float(tick_size)
+
+# negRisk: True → NegRiskCtfExchange / False → CtfExchange
+neg_risk = market["neg_risk"]`},
+
+  // === Signing ===
+  {id:"calc",     x:430, y:60,  label:"计算金额",         phase:"signing",
+   desc:"BUY: makerAmt=size×price(USDC)\nSELL: makerAmt=size(CTF)\n按 tick_size 舍入 + 10^6 精度换算",
+   code:`if side == BUY:
+    raw = round_down(size, 2)
+    maker = to_token_decimals(raw * price)  # USDC ×10^6
+    taker = to_token_decimals(raw)           # CTF token
+elif side == SELL:
+    raw = round_down(size, 2)
+    maker = to_token_decimals(raw)           # CTF token
+    taker = to_token_decimals(raw * price)   # USDC ×10^6`},
+
+  {id:"eip712",   x:650, y:60,  label:"EIP-712 签名\n(每订单)", phase:"signing",
+   desc:"签 Order 结构体 (非 ClobAuth)\n12 字段 → typed hash → secp256k1",
+   code:`class Order(EIP712Struct):
+    salt = Uint(256)          # 随机盐，防重放
+    maker = Address()          # 资金来源地址
+    signer = Address()         # 签名者地址
+    taker = Address()          # 0x0 = 公开单
+    tokenId = Uint(256)        # CTF ERC1155 token id
+    makerAmount = Uint(256)    # 最大卖出额
+    takerAmount = Uint(256)    # 最小收到额
+    expiration = Uint(256)     # 过期时间戳 (0=永不过期)
+    nonce = Uint(256)          # 链上取消用
+    feeRateBps = Uint(256)     # 费率基点
+    side = Uint(8)             # 0=BUY, 1=SELL
+    signatureType = Uint(8)    # 0=EOA, 1=proxy, 2=EIP-1271
+
+# EIP-712 domain: "Polymarket CTF Exchange"
+# typed struct hash → secp256k1 sign → SignedOrder`},
+
+  {id:"auth",     x:240, y:210, label:"ClobAuth\n(会话建立)", phase:"signing",
+   desc:"一次性 EIP-712 签名\n获取 api_key/secret/passphrase\n过期后重签",
+   note:"⚠ 只签一次。跟上面的每单签名是两个独立操作。",
+   session:true},
+
+  {id:"hmac",     x:460, y:210, label:"HMAC 签名\n(每请求)", phase:"signing",
+   desc:"每 POST/DELETE 请求签名\nHMAC-SHA256(secret, ts+method+path+body)",
+   code:`msg = f"{timestamp}\\n{method}\\n{request_path}\\n{body}"
+sig = hmac.new(api_secret.encode(), msg, hashlib.sha256).hex()`,
+   note:"api_key/api_secret/api_passphrase 来自 ClobAuth 步骤"},
+
+  // === Submission ===
+  {id:"post",     x:680, y:150, label:"POST /order",     phase:"submission",
+   desc:"JSON: {order,owner,orderType,postOnly}\nL2 headers: HMAC+L1",
+   code:`body = order_to_json(order, api_key, "GTC", post_only=False)
+headers = create_level_2_headers(signer, creds, ...)
+return post(f"{host}/order", headers=headers, data=serialized)`},
+
+  {id:"srv_val", x:900, y:150,  label:"运营商验证\n(6步顺序)", phase:"submission",
+   desc:"1.HMAC 2.钱包绑定 3.negRisk路由\n4.EIP-712 签验 5.余额/授权 6.tick",
+   code:`// 服务端验证 (Go) — 6步顺序, 任一失败即 4xx
+1. HMAC-SHA256 → 401 if fail
+2. address↔api_key 绑定 → 403 if mismatch
+3. negRisk → NegRiskCtfExchange vs CtfExchange
+4. EIP-712 ecrecover → 400 if invalid
+5. USDC balance ≥ makerAmount → 400
+6. price + tick_size 合规 → 400`,
+   errors:["401: HMAC签名无效","403: api_key未绑定","400: negRisk路由错误→错误合约","400: EIP-712签名无效","400: USDC余额不足","400: CTF授权不足","400: tick违规"]},
+
+  // === Matching ===
+  {id:"book",     x:1140, y:60,  label:"OrderBook\n挂单等待", phase:"matching",
+   desc:"GTC: 永久\nGTD: 有expiration\nFOK/FAK: 即时判定\nPostOnly: 仅maker",
+   code:`type Order struct {
+    ID, TokenID, Maker string
+    Price, Size  *big.Int
+    Side         string  // BUY|SELL
+    OrderType    string  // GTC|GTD|FOK|FAK
+    PostOnly     bool
+    Expiration   int64
+}`},
+
+  {id:"match",    x:1140, y:210, label:"撮合判定\n(1 taker × N makers)", phase:"matching",
+   desc:"价格交叉检查\n看 side+token 组合\n判定 DIRECT | MINT | MERGE",
+   code:`func Match(taker, resting Order) MatchMode {
+    if !pricesCross(taker.Price, resting.Price) {
+        return NO_MATCH  // 跨价 → 继续挂单
+    }
+    // 关键: side 同向 → 铸造/合并
+    //      side 反向 → 直接撮合
+    if taker.Side==BUY && resting.Side==BUY → MINT
+    if taker.Side==SELL && resting.Side==SELL → MERGE
+    return DIRECT
+}`},
+
+  // === Settlement (3 branches) ===
+  {id:"settle_d", x:1380, y:50,  label:"DIRECT\n直接撮合",   phase:"settlement",
+   desc:"双方反向: BUY vs SELL\n同 token: CTF 转账\ncross token: 双边 CTF 交换",
+   code:`// 1 taker BUY YES @ p  撮  N maker SELL YES @ p
+CTF.safeTransferFrom(maker, taker, tokenId, n)
+USDC.transferFrom(taker, maker, n * p)
+// cross-token variant (同市场不同outcome):
+// taker BUY YES @ p  撮  maker SELL NO @ (1-p)
+// 两侧 CTF 互换 + USDC 调整`},
+
+  {id:"settle_m", x:1380, y:180, label:"MINT\n铸造新 CTF",    phase:"settlement",
+   desc:"双方同向 BUY\n凑 USDC → splitPosition\n铸 YES+NO 各一份",
+   code:`// 双方同向 BUY: 凑齐 1.0 USDC 铸 YES+NO
+// taker A: BUY YES @ 0.30 → 出 0.30 USDC
+// taker B: BUY NO  @ 0.70 → 出 0.70 USDC
+USDC.transferFrom(A, CTF, 0.30)   // 收集 USDC
+USDC.transferFrom(B, CTF, 0.70)
+CTF.splitPosition(                 // 铸造
+    collateral, conditionId,
+    [1, 2],                        // partition
+    1_000_000                      // 1 USDC = 10^6
+)
+// → 铸出 1 YES + 1 NO
+CTF.safeTransfer(contract, A, YES, 1)
+CTF.safeTransfer(contract, B, NO,  1)`,
+   fund:`MINT 资金流:
+      A (出 0.30 USDC)
+             ↓
+    ┌── CTF.splitPosition(1.0) ──┐
+    │  铸: YES×1 + NO×1         │
+    └────────────────────────────┘
+             ↓                ↓
+      A 得 1 YES         B 得 1 NO
+ (USDC 锁为抵押品)    (0.70 USDC 同理)
+`},
+
+  {id:"settle_g", x:1380, y:320, label:"MERGE\n合并销毁",    phase:"settlement",
+   desc:"双方同向 SELL\n凑 YES+NO → mergePositions\n销毁 → 换回 USDC",
+   code:`// 双方同向 SELL: 凑齐 1 YES + 1 NO 换 1 USDC
+// taker A: SELL YES → 交出 1 YES
+// taker B: SELL NO  → 交出 1 NO
+CTF.safeTransferFrom(A, CTF, YES, 1)
+CTF.safeTransferFrom(B, CTF, NO,  1)
+CTF.mergePositions(
+    collateral, conditionId,
+    [1, 2],                        // partition
+    1
+)
+// → 销毁 1 YES + 1 NO → 换回 1.0 USDC
+USDC.transfer(A, 0.30)  // A 按 p 分账
+USDC.transfer(B, 0.70)  // B 按 1-p 分账`,
+   fund:`MERGE 资金流:
+      A 交出 1 YES  ─┐
+                    ├→ CTF.mergePositions
+      B 交出 1 NO   ─┘         ↓
+                       销毁 → 换 1 USDC
+                              ↓
+                    A 得 0.30 USDC
+                    B 得 0.70 USDC`},
+
+  // === Terminal ===
+  {id:"ws",       x:1650, y:180, label:"WS 推送",        phase:"settlement",
+   desc:"所有路径终点\norder_update 事件",
+   code:`// WebSocket channel: order_update
+{"type":"order_update","order_id":"0x...",
+ "status":"FILLED",         // | CANCELLED | FAILED | EXPIRED
+ "filled_size":"15.00",
+ "filled_price":"0.171",
+ "reason":""                // 失败时填 revert/sig/balance
+}`},
+
+  // === Error nodes ===
+  {id:"err_sig",   x:900, y:340, label:"✕ 签名/绑定失败",  phase:"error",
+   desc:"HMAC / 钱包绑定 / EIP-712 签名验证\n在运营商验证层被拒"},
+  {id:"err_bal",   x:1140, y:370, label:"✕ 余额/授权不足",  phase:"error",
+   desc:"USDC 余额 < makerAmount\n或 CTF Exchange 未授权"},
+  {id:"err_match", x:1380, y:450, label:"✕ FOK 未成交",    phase:"error",
+   desc:"立即成交或取消类订单\nOrderBook 中无足够对手方"},
+  {id:"err_revert",x:1650, y:330, label:"✕ 链上 Revert",   phase:"error",
+   desc:"三条结算路径统一汇聚\nrevert 后 → WS 推送 FAILED"},
+];
+
+// ─── EDGES ───────────────────────────────────────────────
+const EDGES = [
+  // Pre-flight
+  {f:"query",   t:"validate",   c:"p"},
+  {f:"validate",t:"calc",       c:"p"},
+  // Signing
+  {f:"calc",    t:"eip712",     c:"p"},
+  {f:"eip712",  t:"post",       c:"p"},
+  {f:"auth",    t:"hmac",       c:"p", label:"提供api_key/secret"},
+  {f:"hmac",    t:"post",       c:"p"},
+  // Submission
+  {f:"post",    t:"srv_val",    c:"p"},
+  {f:"srv_val", t:"book",       c:"p"},
+  // Matching
+  {f:"book",    t:"match",      c:"p", label:"价格交叉"},
+  {f:"match",   t:"book",       c:"p", label:"继续等待"},
+  // Settlement: 3 branches → 1 revert → WS
+  {f:"match",   t:"settle_d",   c:"p", label:"DIRECT"},
+  {f:"match",   t:"settle_m",   c:"mint", label:"MINT"},
+  {f:"match",   t:"settle_g",   c:"p", label:"MERGE"},
+  // Success → WS
+  {f:"settle_d",t:"ws",         c:"p", label:"FILLED"},
+  {f:"settle_m",t:"ws",         c:"p", label:"FILLED"},
+  {f:"settle_g",t:"ws",         c:"p", label:"FILLED"},
+  // Cancel → WS
+  {f:"book",    t:"ws",         c:"p", label:"cancel/到期→CANCELED"},
+  // Errors → single revert → WS
+  {f:"srv_val", t:"err_sig",    c:"e"},
+  {f:"srv_val", t:"err_bal",    c:"e"},
+  {f:"match",   t:"err_match",  c:"e"},
+  {f:"settle_d",t:"err_revert", c:"e"},
+  {f:"settle_m",t:"err_revert", c:"e"},
+  {f:"settle_g",t:"err_revert", c:"e"},
+  // All errors → WS
+  {f:"err_sig",  t:"ws",        c:"e", label:"FAILED"},
+  {f:"err_bal",  t:"ws",        c:"e", label:"FAILED"},
+  {f:"err_match",t:"ws",        c:"e", label:"FAILED"},
+  {f:"err_revert",t:"ws",       c:"e", label:"FAILED"},
+];
+
+// ─── PHASES ──────────────────────────────────────────────
+const PHASES = [
+  {n:"预检",    y:30, h:70,  ns:["query","validate"]},
+  {n:"签名",    y:130, h:170, ns:["calc","eip712","auth","hmac"]},
+  {n:"提交",    y:120, h:130, ns:["post","srv_val"]},
+  {n:"撮合",    y:30, h:430, ns:["book","match","err_match"]},
+  {n:"链上结算", y:30, h:490, ns:["settle_d","settle_m","settle_g","ws","err_revert","err_bal","err_sig"]},
+];
+
+// ─── ARROW ───────────────────────────────────────────────
+const Arrow = ({x1,y1,x2,y2,c,label:lbl}) => {
+  const dx=x2-x1, dy=y2-y1, len=Math.sqrt(dx*dx+dy*dy);
+  if(len<1) return null;
+  const ux=dx/len, uy=dy/len, ah=5, aw=7;
+  const ex=x2-ux*aw, ey=y2-uy*aw;
+  const cls=`edge ${c}`;
+  const off = (c==='e'&&lbl)?10:0;
+  const mlx=(x1+ex)/2-uy*(6+off), mly=(y1+ey)/2+ux*(6+off);
+  return <g className={cls}>
+    <line x1={x1} y1={y1} x2={ex} y2={ey}/>
+    <polygon points={`${x2},${y2} ${ex-uy*ah},${ey+ux*ah} ${ex+uy*ah},${ey-ux*ah}`}/>
+    {lbl && <text x={mlx} y={mly} textAnchor="middle" fontSize={8} fill="#8b949e">{lbl}</text>}
+  </g>;
+};
+
+// ─── APP ─────────────────────────────────────────────────
+const App = () => {
+  const [sel,setSel] = useState("query");
+  const nm = Object.fromEntries(NODES.map(n=>[n.id,n]));
+  const s = nm[sel];
+
+  return <div style={{display:"flex",height:"100vh"}}>
+    <div style={{flex:1,overflow:"auto",position:"relative"}}>
+      <svg viewBox="0 0 1850 560" style={{minWidth:1850,minHeight:560}}>
+        {PHASES.map((p,i)=><g key={i}>
+          <rect className="phase-band" x={0} y={p.y} width={1850} height={p.h} fill="#1c2128"/>
+          <text className="phase-label" x={10} y={p.y+16}>{p.n}</text>
+        </g>)}
+        {EDGES.map((e,i)=>{
+          const f=nm[e.f], t=nm[e.t];
+          let x1=f.x+W/2, y1=f.y+H/2, x2=t.x+W/2, y2=t.y+H/2;
+          let sx,sy,ex,ey;
+          if(Math.abs(x2-x1)>Math.abs(y2-y1)){
+            sx=x1<x2?f.x+W:f.x; sy=y1; ex=x1<x2?t.x:t.x+W; ey=y2;
+          }else{
+            sx=x1; sy=y1<y2?f.y+H:f.y; ex=x2; ey=y1<y2?t.y:t.y+H;
+          }
+          return <Arrow key={i} x1={sx} y1={sy} x2={ex} y2={ey} c={e.c} label={e.label}/>;
+        })}
+        {NODES.map(n=>{
+          const isErr=n.phase==="error", isSel=n.id===sel, isSes=n.session;
+          const fill=isErr?"#2d1518":"#1c2128";
+          const sc=isErr?"#f85149":isSel?"#f78166":"#30363d";
+          return <g key={n.id} className={`node${isSel?' selected':''}${isSes?' session':''}`}
+                   onClick={()=>setSel(n.id)}>
+            <rect x={n.x} y={n.y} width={W} height={H} fill={fill} stroke={sc}/>
+            {(n.label||"").split('\n').map((l,i)=>
+              <text key={i} className={i===0?"label":""} x={n.x+W/2} y={n.y+16+i*16} textAnchor="middle" fontSize={i===0?12:10}>{l}</text>
+            )}
+          </g>;
+        })}
+      </svg>
+      <div className="legend">
+        <div className="legend-item"><div className="legend-line" style={{background:"#3fb950"}}/><span>主成功路径</span></div>
+        <div className="legend-item"><div className="legend-line" style={{background:"#d2991d"}}/><span>MINT 铸造分支</span></div>
+        <div className="legend-item"><div className="legend-line" style={{background:"#30363d"}}/><span>会话级 (虚线框)</span></div>
+        <div className="legend-item"><div className="legend-line" style={{background:"#f85149",borderBottom:"1px dashed #f85149"}}/><span>错误分支</span></div>
+        <div style={{marginTop:6,color:"#8b949e",fontSize:10}}>点击节点查看详情 | 所有路径终点→WS推送</div>
+      </div>
+    </div>
+
+    <div className="panel">
+      <h3>{s.phase==="error"?"✕ ":""}{s.label.split('\n')[0]}</h3>
+      <div style={{color:"#8b949e",marginBottom:12}}>{(s.desc||"").split('\n').map((l,i)=><div key={i}>{l}</div>)}</div>
+      {s.fund && <div className="fund">{s.fund}</div>}
+      {s.code && <><hr/><h4>源码</h4><code style={{whiteSpace:"pre"}}>{s.code}</code></>}
+      {s.note && <div className="note">{(s.note||"").split('\n').map((l,i)=><div key={i}>{l}</div>)}</div>}
+      {s.errors && <><hr/><h4>错误分支</h4>{s.errors.map((e,i)=><div key={i} className="err">{e}</div>)}</>}
+    </div>
+  </div>;
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

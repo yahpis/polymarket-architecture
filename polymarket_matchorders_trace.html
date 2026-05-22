@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>matchOrders 链上 Trace</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,monospace;background:#0d1117;color:#c9d1d9;padding:30px;max-width:1000px;margin:0 auto;line-height:1.7}
+h1{color:#58a6ff;font-size:20px;margin-bottom:8px}
+h2{color:#7ee787;font-size:15px;margin:24px 0 8px;border-bottom:1px solid #30363d;padding-bottom:4px}
+.subtitle{color:#8b949e;font-size:13px;margin-bottom:20px}
+.step{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px 18px;margin:12px 0}
+.step .num{color:#f78166;font-weight:600;font-size:13px}
+.step .fn{color:#58a6ff;font-weight:600}
+.step .comment{color:#8b949e;font-size:12px;margin:4px 0}
+pre{background:#1c2128;padding:12px;border-radius:4px;overflow-x:auto;font-size:12px;line-height:1.5;margin:8px 0}
+.balance{background:#1c2128;padding:8px 12px;border-radius:4px;font-family:monospace;font-size:12px;margin:6px 0}
+.balance .label{color:#8b949e}
+.balance .val{color:#79c0ff}
+.balance .delta{color:#7ee787}
+.eq{color:#f78166;font-size:14px;margin:8px 0;font-weight:600}
+.emit{color:#d2a8ff;font-size:12px;margin:4px 0;padding:4px 8px;background:#1c2128;border-left:3px solid #d2a8ff}
+.note{color:#d2991d;font-size:12px;padding:6px 10px;background:#1c2128;border-left:3px solid #d2991d;margin:8px 0}
+</style>
+</head>
+<body>
+
+<h1>CTFExchange._matchOrders — 链上 Trace</h1>
+<div class="subtitle">
+  合约: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E<br>
+  来源: Trading.sol L105-147 (Polygon 验证源码)<br>
+  场景: 1 taker BUY YES × 3 makers (COMPLEMENTARY + MINT + MERGE)
+</div>
+
+<h2>输入参数</h2>
+
+<div class="step">
+<div class="num">Taker Order</div>
+<pre>Order {
+  salt: 0xabc...
+  maker: 0xTaker    signer: 0xTaker    taker: 0x0000
+  tokenId: YES (0xA...001)              side: BUY (0)
+  makerAmount: 30_000_000    (30 USDC)
+  takerAmount: 100           (100 shares YES)
+  expiration: 0 (永不过期)   nonce: 42
+  feeRateBps: 0              signatureType: EOA (0)
+}</pre>
+</div>
+
+<div class="step">
+<div class="num">Maker Orders[3] + FillAmounts[3]</div>
+<pre>makerOrders[0]: SELL YES @ 0.172, 15 shares → fillAmount=15
+  (opposite side, same tokenId → COMPLEMENTARY)
+
+makerOrders[1]: BUY NO @ 0.83, 20 shares → fillAmount=20
+  (both BUY, complementary tokenId → MINT)
+
+makerOrders[2]: SELL NO @ 0.95, 10 shares → fillAmount=10
+  (both SELL, complementary tokenId → MERGE)</pre>
+</div>
+
+<div class="eq">takerFillAmount = 15+20+10 = 45 (makerAmount units)</div>
+
+<h2>Step 1: Taker 预处理</h2>
+
+<div class="step">
+<div class="num">L109</div>
+<div class="fn">making = takerFillAmount = 45</div>
+<div class="comment">// 填充量，以 makerAmount 为单位</div>
+</div>
+
+<div class="step">
+<div class="num">L111</div>
+<div class="fn">_performOrderChecks(takerOrder, making=45)</div>
+<div class="comment">
+→ _validateTaker(0x0) — 零地址=公开单，通过<br>
+→ hashOrder(takerOrder) → orderHash = keccak256(struct)<br>
+→ _validateOrder: 过期/签名/fee/token/填充状态/随机数 → OK<br>
+→ takingAmount = 45 × 100 ÷ 30,000,000 = 0.0015 (实际 0，太小)
+</div>
+<div class="note">简化：takerAmount=makerAmount（报价 1.0 买入 1 YES = 1 USDC）<br>takingAmount = 45 × 1/1 = 45</div>
+</div>
+
+<div class="step">
+<div class="num">L112</div>
+<div class="fn">_deriveAssetIds(takerOrder)</div>
+<pre>side==BUY → makerAssetId=0 (USDC), takerAssetId=YES</pre>
+</div>
+
+<div class="step">
+<div class="num">L115</div>
+<div class="fn">_transfer(taker, Exchange, USDC, 45)</div>
+<div class="comment">// Taker 的 USDC 转入 Exchange 托管</div>
+
+<div class="balance">
+<span class="label">Exchange 余额变化:</span><br>
+<span class="label">EX.USDC</span> <span class="delta">+45</span> → <span class="val">45</span>&nbsp;&nbsp;
+<span class="label">EX.YES</span> <span class="val">0</span>&nbsp;&nbsp;
+<span class="label">EX.NO</span> <span class="val">0</span>
+</div>
+</div>
+
+<h2>Step 2: 填充 Maker[0] — COMPLEMENTARY</h2>
+
+<div class="step">
+<div class="num">L175 (in _fillMakerOrder)</div>
+<div class="fn">_deriveMatchType(taker, maker0)</div>
+<pre>taker.side==BUY, maker0.side==SELL → COMPLEMENTARY</pre>
+</div>
+
+<div class="step">
+<div class="num">L177</div>
+<div class="fn">_validateTakerAndMaker</div>
+<pre>_isCrossing: price(taker) ≥ price(maker0)? taker 1.0 ≥ maker 0.172 ✓
+tokenId 检查: taker.YES == maker0.YES ✓</pre>
+</div>
+
+<div class="step">
+<div class="num">L179-L184</div>
+<div class="fn">_performOrderChecks(maker0, making=15)</div>
+<div class="comment">验证 maker0 的 order 状态 + 计算 taking</div>
+</div>
+
+<div class="step">
+<div class="num">L187</div>
+<div class="fn">_deriveAssetIds(maker0)</div>
+<pre>side==SELL → makerAssetId=YES, takerAssetId=0 (USDC)</pre>
+</div>
+
+<div class="step">
+<div class="num">L189</div>
+<div class="fn">_fillFacingExchange(making=15, taking=2.58, maker0, YES, USDC, COMPLEMENTARY, fee=0)</div>
+
+<div class="balance">
+<span class="label">_transfer(maker0→Exchange, YES, 15) — maker 交出 YES token</span><br>
+<span class="label">EX.USDC</span> <span class="val">45</span>&nbsp;&nbsp;
+<span class="label">EX.YES</span> <span class="delta">+15</span> → <span class="val">15</span>&nbsp;&nbsp;
+<span class="label">EX.NO</span> <span class="val">0</span>
+</div>
+
+<div class="comment">_executeMatchCall → COMPLEMENTARY → return (nop, token 已存在)</div>
+
+<div class="balance">
+<span class="label">_transfer(Exchange→maker0, USDC, 2.58) — 付钱给 maker</span><br>
+<span class="label">EX.USDC</span> <span class="delta">-2.58</span> → <span class="val">42.42</span>&nbsp;&nbsp;
+<span class="label">EX.YES</span> <span class="val">15</span>&nbsp;&nbsp;
+<span class="label">EX.NO</span> <span class="val">0</span>
+</div>
+</div>
+
+<h2>Step 3: 填充 Maker[1] — MINT</h2>
+
+<div class="step">
+<div class="num">L175</div>
+<div class="fn">_deriveMatchType(taker, maker1)</div>
+<pre>taker.side==BUY, maker1.side==BUY → MINT</pre>
+</div>
+
+<div class="step">
+<div class="num">L177</div>
+<div class="fn">_validateTakerAndMaker</div>
+<pre>_isCrossing: takerBuy @ 1.0 + makerBuy @ 0.83 = 1.83 ≥ 1 ✓
+validateComplement(YES, NO) — 互补 tokenId ✓</pre>
+</div>
+
+<div class="step">
+<div class="num">L179-L187</div>
+<div class="fn">_performOrderChecks(maker1, 20) → taking=20</div>
+<div class="fn">_deriveAssetIds(maker1)</div>
+<pre>side==BUY → makerAssetId=0 (USDC), takerAssetId=NO</pre>
+</div>
+
+<div class="step">
+<div class="num">L189</div>
+<div class="fn">_fillFacingExchange(making=20, taking=20, maker1, USDC, NO, MINT, fee=0)</div>
+
+<div class="balance">
+<span class="label">_transfer(maker1→Exchange, USDC, 20) — maker 交 USDC</span><br>
+<span class="label">EX.USDC</span> <span class="delta">+20</span> → <span class="val">62.42</span>&nbsp;&nbsp;
+<span class="label">EX.YES</span> <span class="val">15</span>&nbsp;&nbsp;
+<span class="label">EX.NO</span> <span class="val">0</span>
+</div>
+
+<div class="comment">_executeMatchCall → MINT → _mint(conditionId, 20)</div>
+
+<pre>CTF.splitPosition(USDC, conditionId, [1,2], 20_000_000)
+// 用 20 USDC 作为抵押品铸造完整集合
+// → 铸出 20 YES + 20 NO (到 Exchange 地址)</pre>
+
+<div class="balance">
+<span class="label">Exchange 余额变化 (铸币后):</span><br>
+<span class="label">EX.USDC</span> <span class="delta">-20</span> → <span class="val">42.42</span>&nbsp;&nbsp;
+<span class="label">EX.YES</span> <span class="delta">+20</span> → <span class="val">35</span>&nbsp;&nbsp;
+<span class="label">EX.NO</span> <span class="delta">+20</span> → <span class="val">20</span>
+</div>
+
+<div class="balance">
+<span class="label">_transfer(Exchange→maker1, NO, 20) — 付 NO token 给 maker</span><br>
+<span class="label">EX.USDC</span> <span class="val">42.42</span>&nbsp;&nbsp;
+<span class="label">EX.YES</span> <span class="val">35</span>&nbsp;&nbsp;
+<span class="label">EX.NO</span> <span class="delta">-20</span> → <span class="val">0</span>
+</div>
+</div>
+
+<div class="note">关键：MINT 过程中 Exchange 的 USDC 被 splitPosition 消耗 20，同时铸出 20 YES + 20 NO。资产从 (USDC) 形态变为 (YES+NO) 形态。Taker 要的是 YES——而 Exchange 现在有 35 YES（来自 maker0 的 15 + mint 的 20）。</div>
+
+<h2>Step 4: 填充 Maker[2] — MERGE</h2>
+
+<div class="step">
+<div class="num">L175</div>
+<div class="fn">_deriveMatchType(taker, maker2)</div>
+<pre>taker.side==BUY, maker2.side==SELL → COMPLEMENTARY</pre>
+<div class="note">等等——我的场景设计有误。maker[2] 是 SELL NO，taker 是 BUY YES。<br>这是 COMPLEMENTARY 还是 MERGE？看合约：<br>_deriveMatchType: BUY+SELL → COMPLEMENTARY<br>但 _validateTakerAndMaker: COMPLEMENTARY 要求 SAME tokenId<br>maker2 是 SELL NO (tokenId=NO), taker 是 BUY YES (tokenId=YES)<br>→ MismatchedTokenIds → REVERT!</div>
+
+<div class="comment">修正场景：maker[2] 改为 SELL YES (同 tokenId)</div>
+<pre>makerOrders[2]: SELL YES @ 0.50, 10 shares → COMPLEMENTARY
+_deriveMatchType: BUY + SELL → COMPLEMENTARY ✓
+_validateTakerAndMaker: YES==YES ✓</pre>
+</div>
+
+<div class="step">
+<div class="num">L189</div>
+<div class="fn">_fillFacingExchange(making=10, taking=5, maker2, YES, USDC, COMPLEMENTARY, fee=0)</div>
+
+<div class="balance">
+<span class="label">_transfer(maker2→Exchange, YES, 10)</span><br>
+<span class="label">EX.USDC</span> <span class="val">42.42</span>&nbsp;&nbsp;
+<span class="label">EX.YES</span> <span class="delta">+10</span> → <span class="val">45</span>&nbsp;&nbsp;
+<span class="label">EX.NO</span> <span class="val">0</span>
+</div>
+
+<div class="comment">_executeMatchCall → COMPLEMENTARY → skip</div>
+
+<div class="balance">
+<span class="label">_transfer(Exchange→maker2, USDC, 5)</span><br>
+<span class="label">EX.USDC</span> <span class="delta">-5</span> → <span class="val">37.42</span>&nbsp;&nbsp;
+<span class="label">EX.YES</span> <span class="val">45</span>&nbsp;&nbsp;
+<span class="label">EX.NO</span> <span class="val">0</span>
+</div>
+</div>
+
+<div class="note">第 4 步是一个关键认识：BUY YES taker 能撮 SELL NO maker 吗？合约说不能——COMPLEMENTARY 要求 SAME tokenId。SELL NO 只能通过 MERGE 撮另一个 SELL YES。<br>
+<br>
+所以真实的混合批次不会有 BUY YES × SELL NO 的组合。MINT/MERGE 处理同向互补 token，COMPLEMENTARY 只处理同 token 反向。</div>
+
+<h2>Step 5: 结算 Taker</h2>
+
+<div class="step">
+<div class="num">L119</div>
+<div class="fn">taking = _updateTakingWithSurplus(minTaking=45, YES)</div>
+
+<div class="balance">
+<span class="label">_getBalance(YES) = 45 — Exchange 内的 YES 余额</span><br>
+<span class="label">45 ≥ 45 ✓ → taking = 45</span>
+</div>
+<div class="comment">如果 mint 产生多余 token（比如填 19 但 mint 了 20），surplus 归 taker</div>
+</div>
+
+<div class="step">
+<div class="num">L120-L124</div>
+<div class="fn">fee = calculateFee(feeRateBps=0, ...) = 0</div>
+</div>
+
+<div class="step">
+<div class="num">L127</div>
+<div class="fn">_transfer(Exchange→taker, YES, 45 — 0 = 45)</div>
+
+<div class="balance">
+<span class="label">EX.USDC</span> <span class="delta">(不变)</span> → <span class="val">37.42</span>&nbsp;&nbsp;
+<span class="label">EX.YES</span> <span class="delta">-45</span> → <span class="val">0</span>&nbsp;&nbsp;
+<span class="label">EX.NO</span> <span class="val">0</span>
+</div>
+</div>
+
+<div class="step">
+<div class="num">L133-L134</div>
+<div class="fn">退零头: refund = _getBalance(USDC) = 37.42</div>
+<pre>_transfer(Exchange→taker, USDC, 37.42)
+// Taker 多存的 USDC 退回</pre>
+
+<div class="balance">
+<span class="label">最终 Exchange 余额:</span><br>
+<span class="label">EX.USDC</span> <span class="val">0</span>&nbsp;&nbsp;
+<span class="label">EX.YES</span> <span class="val">0</span>&nbsp;&nbsp;
+<span class="label">EX.NO</span> <span class="val">0</span>
+</div>
+</div>
+
+<div class="step">
+<div class="emit">emit OrdersMatched(orderHash, taker, USDC, YES, 45, 45)</div>
+<div class="emit">emit OrderFilled(orderHash, taker, Exchange, USDC, YES, 45, 45, 0)</div>
+</div>
+
+<h2>完整链路总结</h2>
+
+<div class="step">
+<pre>
+Taker BUY YES (45 USDC)
+    │
+    ├─→ Maker0 SELL YES @ 0.172 (15 shares)        [COMPLEMENTARY]
+    │    maker0 交出 YES → Exchange
+    │    Exchange 付 2.58 USDC 给 maker0
+    │
+    ├─→ Maker1 BUY NO @ 0.83 (20 shares)           [MINT]
+    │    maker1 交 20 USDC → Exchange
+    │    splitPosition(20 USDC) → 铸 20 YES + 20 NO
+    │    Exchange 付 20 NO 给 maker1
+    │
+    └─→ Maker2 SELL YES @ 0.50 (10 shares)         [COMPLEMENTARY]
+         maker2 交出 10 YES → Exchange
+         Exchange 付 5 USDC 给 maker2
+
+Exchange 聚合: 15 YES(direct) + 20 YES(mint) + 10 YES(direct) = 45 YES
+    │
+    └─→ Taker 收到 45 YES
+        退零头 37.42 USDC
+
+Taker 净消耗: 45 — 37.42 = 7.58 USDC → 获得 45 YES
+实际价格: 7.58 ÷ 45 = 0.168 YES/USDC
+</pre>
+</div>
+
+</body>
+</html>
